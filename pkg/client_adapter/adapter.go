@@ -3,11 +3,9 @@ package client_adapter
 import (
 	"context"
 	"io"
-	"time"
 
 	"github.com/restic/restic/internal/archiver"
 	"github.com/restic/restic/internal/checker"
-	"github.com/restic/restic/internal/crypto"
 	"github.com/restic/restic/internal/fs"
 	"github.com/restic/restic/internal/repository"
 	"github.com/restic/restic/internal/restic"
@@ -35,6 +33,15 @@ type RewindReader = restic.RewindReader
 
 func NewRepository(be Backend, opts Options) (*Repository, error) {
 	return repository.New(be, opts)
+}
+
+// ============================================================================
+// FS
+// ============================================================================
+
+type LocalFS = fs.Local
+func NewLocalFS() LocalFS {
+	return fs.Local{}
 }
 
 // ============================================================================
