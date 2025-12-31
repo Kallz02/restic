@@ -27,6 +27,7 @@ type FileType = restic.FileType
 type Handle = restic.Handle
 type FileInfo = restic.FileInfo
 type RewindReader = restic.RewindReader
+type BlobType = restic.BlobType
 
 // ============================================================================
 // REPOSITORY
