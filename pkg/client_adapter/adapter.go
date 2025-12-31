@@ -3,6 +3,7 @@ package client_adapter
 import (
 	"context"
 	"io"
+	"time"
 
 	"github.com/restic/restic/internal/archiver"
 	"github.com/restic/restic/internal/checker"
@@ -69,6 +70,16 @@ func NewRestorer(repo restic.Repository, sn *restic.Snapshot, sparse bool, p *pr
 
 func NewChecker(repo restic.Repository, checkUnused bool) *checker.Checker {
 	return checker.New(repo, checkUnused)
+}
+
+// ============================================================================
+// LOCKS
+// ============================================================================
+
+type Lock = restic.Lock
+
+func NewExclusiveLock(ctx context.Context, repo restic.Repository, retrySleep time.Duration, p *progress.Counter) (*Lock, context.Context, error) {
+	return restic.NewExclusiveLock(ctx, repo, retrySleep, p)
 }
 
 // ============================================================================
