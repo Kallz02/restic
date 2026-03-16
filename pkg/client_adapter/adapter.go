@@ -209,12 +209,32 @@ func LoadSnapshot(ctx context.Context, repo restic.Repository, id ID) (*Snapshot
 	return data.LoadSnapshot(ctx, restic.LoaderUnpacked(repo), id)
 }
 
-// Tree/Node types and LoadTree for snapshot browsing
-type Tree = data.Tree
+// Tree/Node types and LoadTree for snapshot browsing.
+// upstream data.LoadTree now returns an iterator, so we materialize it back
+// into the old Tree{Nodes} shape expected by the FFI layer.
+type Tree struct {
+	Nodes []*Node
+}
+
 type Node = data.Node
 
 func LoadTree(ctx context.Context, repo restic.Repository, id ID) (*Tree, error) {
-	return data.LoadTree(ctx, repo, id)
+	it, err := data.LoadTree(ctx, repo, id)
+	if err != nil {
+		return nil, err
+	}
+
+	nodes := make([]*Node, 0)
+	for item := range it {
+		if item.Error != nil {
+			return nil, item.Error
+		}
+		if item.Node != nil {
+			nodes = append(nodes, item.Node)
+		}
+	}
+
+	return &Tree{Nodes: nodes}, nil
 }
 
 // DataBlob is the blob type for file content
