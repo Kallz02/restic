@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"runtime"
 	"sort"
 	"sync"
@@ -377,6 +378,7 @@ func (r *Repository) getZstdDecoder() *zstd.Decoder {
 // caller must ensure that the id matches the data. Returned is the size data
 // occupies in the repo (compressed or not, including the encryption overhead).
 func (r *Repository) saveAndEncrypt(ctx context.Context, t restic.BlobType, data []byte, id restic.ID) (size int, err error) {
+	fmt.Fprintf(os.Stderr, "[DEBUG saveAndEncrypt] type=%v id=%v dataLen=%d\n", t, id, len(data))
 	debug.Log("save id %v (%v, %d bytes)", id, t, len(data))
 
 	uncompressedLength := 0
@@ -563,22 +565,31 @@ func (r *Repository) removeUnpacked(ctx context.Context, t restic.FileType, id r
 
 func (r *Repository) WithBlobUploader(ctx context.Context, fn func(ctx context.Context, uploader restic.BlobSaverWithAsync) error) error {
 	wg, ctx := errgroup.WithContext(ctx)
+	limit := 2 + runtime.GOMAXPROCS(0)
+	fmt.Fprintf(os.Stderr, "[DEBUG WithBlobUploader] SetLimit=%d GOMAXPROCS=%d Connections=%d\n", limit, runtime.GOMAXPROCS(0), r.Connections())
 	// pack uploader + wg.Go below + blob saver (CPU bound)
-	wg.SetLimit(2 + runtime.GOMAXPROCS(0))
+	wg.SetLimit(limit)
 	r.mainWg = wg
 	r.startPackUploader(ctx, wg)
 	// blob saver are spawned on demand, use wait group to keep track of them
 	r.blobSaver = &sync.WaitGroup{}
 	wg.Go(func() error {
+		fmt.Fprintf(os.Stderr, "[DEBUG WithBlobUploader] calling fn\n")
 		if err := fn(ctx, &blobSaverRepo{repo: r}); err != nil {
+			fmt.Fprintf(os.Stderr, "[DEBUG WithBlobUploader] fn ERROR: %v\n", err)
 			return err
 		}
+		fmt.Fprintf(os.Stderr, "[DEBUG WithBlobUploader] fn OK, calling flush\n")
 		if err := r.flush(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "[DEBUG WithBlobUploader] flush ERROR: %v\n", err)
 			return fmt.Errorf("error flushing repository: %w", err)
 		}
+		fmt.Fprintf(os.Stderr, "[DEBUG WithBlobUploader] flush OK\n")
 		return nil
 	})
-	return wg.Wait()
+	err := wg.Wait()
+	fmt.Fprintf(os.Stderr, "[DEBUG WithBlobUploader] wg.Wait returned: %v\n", err)
+	return err
 }
 
 func (r *Repository) startPackUploader(ctx context.Context, wg *errgroup.Group) {
@@ -632,17 +643,23 @@ func (r *Repository) flushBlobSaver() {
 // FlushPacks saves all remaining packs.
 func (r *Repository) flushPackUploader(ctx context.Context) error {
 	if r.packerWg == nil {
+		fmt.Fprintf(os.Stderr, "[DEBUG flushPackUploader] packerWg is nil, skipping\n")
 		return nil
 	}
 
+	fmt.Fprintf(os.Stderr, "[DEBUG flushPackUploader] flushing treePM\n")
 	err := r.treePM.Flush(ctx)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "[DEBUG flushPackUploader] treePM.Flush ERROR: %v\n", err)
 		return err
 	}
+	fmt.Fprintf(os.Stderr, "[DEBUG flushPackUploader] flushing dataPM\n")
 	err = r.dataPM.Flush(ctx)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "[DEBUG flushPackUploader] dataPM.Flush ERROR: %v\n", err)
 		return err
 	}
+	fmt.Fprintf(os.Stderr, "[DEBUG flushPackUploader] TriggerShutdown, waiting for packerWg\n")
 	r.uploader.TriggerShutdown()
 	err = r.packerWg.Wait()
 
@@ -1017,6 +1034,7 @@ func (r *Repository) saveBlob(ctx context.Context, t restic.BlobType, buf []byte
 }
 
 func (r *Repository) saveBlobAsync(ctx context.Context, t restic.BlobType, buf []byte, id restic.ID, storeDuplicate bool, cb func(newID restic.ID, known bool, size int, err error)) {
+	fmt.Fprintf(os.Stderr, "[DEBUG saveBlobAsync] type=%v bufLen=%d queuing to mainWg\n", t, len(buf))
 	r.mainWg.Go(func() error {
 		if ctx.Err() != nil {
 			// fail fast if the context is cancelled

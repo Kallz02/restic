@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"fmt"
 	"io"
 	"math/big"
 	"os"
@@ -57,18 +58,25 @@ func (r *packerManager) Flush(ctx context.Context) error {
 	r.pm.Lock()
 	defer r.pm.Unlock()
 
+	fmt.Fprintf(os.Stderr, "[DEBUG packerManager.Flush] tpe=%v starting merge\n", r.tpe)
 	pendingPackers, err := r.mergePackers()
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "[DEBUG packerManager.Flush] mergePackers ERROR: %v\n", err)
 		return err
 	}
 
-	for _, packer := range pendingPackers {
+	fmt.Fprintf(os.Stderr, "[DEBUG packerManager.Flush] tpe=%v pendingPackers=%d\n", r.tpe, len(pendingPackers))
+	for i, packer := range pendingPackers {
+		fmt.Fprintf(os.Stderr, "[DEBUG packerManager.Flush] queueing packer[%d] size=%d blobs=%d\n", i, packer.Size(), packer.Count())
 		debug.Log("manually flushing pending pack")
 		err := r.queueFn(ctx, r.tpe, packer)
 		if err != nil {
+			fmt.Fprintf(os.Stderr, "[DEBUG packerManager.Flush] queueFn ERROR: %v\n", err)
 			return err
 		}
+		fmt.Fprintf(os.Stderr, "[DEBUG packerManager.Flush] packer[%d] queued OK\n", i)
 	}
+	fmt.Fprintf(os.Stderr, "[DEBUG packerManager.Flush] tpe=%v done\n", r.tpe)
 	return nil
 }
 
@@ -114,6 +122,7 @@ func (r *packerManager) mergePackers() ([]*packer, error) {
 }
 
 func (r *packerManager) SaveBlob(ctx context.Context, t restic.BlobType, id restic.ID, ciphertext []byte, uncompressedLength int) (int, error) {
+	fmt.Fprintf(os.Stderr, "[DEBUG packerManager.SaveBlob] type=%v id=%v ciphertextLen=%d\n", t, id, len(ciphertext))
 	r.pm.Lock()
 	defer r.pm.Unlock()
 
@@ -219,6 +228,7 @@ func (r *packerManager) newPacker() (pck *packer, err error) {
 
 // savePacker stores p in the backend.
 func (r *Repository) savePacker(ctx context.Context, t restic.BlobType, p *packer) error {
+	fmt.Fprintf(os.Stderr, "[DEBUG savePacker] type=%v blobs=%d size=%d\n", t, p.Packer.Count(), p.Packer.Size())
 	debug.Log("save packer for %v with %d blobs (%d bytes)\n", t, p.Packer.Count(), p.Packer.Size())
 	err := p.Packer.Finalize()
 	if err != nil {
