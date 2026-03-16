@@ -2,18 +2,33 @@ package client_adapter
 
 import (
 	"context"
+	stderrors "errors"
 	"time"
 
 	"github.com/restic/restic/internal/archiver"
 	"github.com/restic/restic/internal/backend"
 	"github.com/restic/restic/internal/checker"
 	"github.com/restic/restic/internal/data"
+	"github.com/restic/restic/internal/filter"
 	"github.com/restic/restic/internal/fs"
+	"github.com/restic/restic/internal/global"
 	"github.com/restic/restic/internal/repository"
 	"github.com/restic/restic/internal/repository/index"
 	"github.com/restic/restic/internal/restic"
 	"github.com/restic/restic/internal/restorer"
+	"github.com/restic/restic/internal/ui"
 	"github.com/restic/restic/internal/ui/progress"
+)
+
+const (
+	ResticExitSuccess                = 0
+	ResticExitFailure                = 1
+	ResticExitGoRuntimeError         = 2
+	ResticExitIncompleteSourceData   = 3
+	ResticExitRepositoryDoesNotExist = 10
+	ResticExitRepositoryLocked       = 11
+	ResticExitWrongPassword          = 12
+	ResticExitInterrupted            = 130
 )
 
 // ============================================================================
@@ -61,6 +76,75 @@ func NewArchiver(repo restic.Repository, fs fs.FS, opts archiver.Options) *archi
 
 type ArchiverOptions = archiver.Options
 type SnapshotOptions = archiver.SnapshotOptions
+type ItemStats = archiver.ItemStats
+type Scanner = archiver.Scanner
+type ScanStats = archiver.ScanStats
+type SelectByNameFunc = archiver.SelectByNameFunc
+type SelectFunc = archiver.SelectFunc
+type RejectByNameFunc = archiver.RejectByNameFunc
+type RejectFunc = archiver.RejectFunc
+type IncludeByNameFunc = filter.IncludeByNameFunc
+
+func NewScanner(filesystem fs.FS) *Scanner {
+	return archiver.NewScanner(filesystem)
+}
+
+func CombineRejectByNames(funcs []RejectByNameFunc) SelectByNameFunc {
+	return archiver.CombineRejectByNames(funcs)
+}
+
+func CombineRejects(funcs []RejectFunc) SelectFunc {
+	return archiver.CombineRejects(funcs)
+}
+
+func CombineIncludeByNames(funcs []IncludeByNameFunc) SelectByNameFunc {
+	return func(item string) bool {
+		if len(funcs) == 0 {
+			return true
+		}
+
+		for _, include := range funcs {
+			matched, childMayMatch := include(item)
+			if matched || childMayMatch {
+				return true
+			}
+		}
+
+		return false
+	}
+}
+
+func RejectByDevice(samples []string, filesystem fs.FS) (RejectFunc, error) {
+	return archiver.RejectByDevice(samples, filesystem)
+}
+
+func RejectBySize(maxSize int64) (RejectFunc, error) {
+	return archiver.RejectBySize(maxSize)
+}
+
+func RejectIfPresent(excludeFileSpec string, warnf func(msg string, args ...interface{})) (RejectFunc, error) {
+	return archiver.RejectIfPresent(excludeFileSpec, warnf)
+}
+
+func IncludeByPattern(patterns []string, warnf func(msg string, args ...interface{})) IncludeByNameFunc {
+	return filter.IncludeByPattern(patterns, warnf)
+}
+
+func IncludeByInsensitivePattern(patterns []string, warnf func(msg string, args ...interface{})) IncludeByNameFunc {
+	return filter.IncludeByInsensitivePattern(patterns, warnf)
+}
+
+func RejectByPattern(patterns []string, warnf func(msg string, args ...interface{})) RejectByNameFunc {
+	return archiver.RejectByNameFunc(filter.RejectByPattern(patterns, warnf))
+}
+
+func RejectByInsensitivePattern(patterns []string, warnf func(msg string, args ...interface{})) RejectByNameFunc {
+	return archiver.RejectByNameFunc(filter.RejectByInsensitivePattern(patterns, warnf))
+}
+
+func ParseBytes(value string) (int64, error) {
+	return ui.ParseBytes(value)
+}
 
 // ============================================================================
 // RESTORER
@@ -70,6 +154,10 @@ type RestoreOptions = restorer.Options
 
 func NewRestorer(repo restic.Repository, sn *Snapshot, opts RestoreOptions) *restorer.Restorer {
 	return restorer.NewRestorer(repo, sn, opts)
+}
+
+func SetRepositoryDryRun(repo *Repository) {
+	repo.SetDryRun()
 }
 
 // ============================================================================
@@ -200,6 +288,22 @@ func NewExclusiveLock(ctx context.Context, repo restic.Repository, retrySleep ti
 	return lock, ctx, err
 }
 
+func IsAlreadyLocked(err error) bool {
+	return restic.IsAlreadyLocked(err)
+}
+
+func IsNoKeyFound(err error) bool {
+	return stderrors.Is(err, repository.ErrNoKeyFound)
+}
+
+func IsNoRepository(err error) bool {
+	return stderrors.Is(err, global.ErrNoRepository)
+}
+
+func IsCanceled(err error) bool {
+	return stderrors.Is(err, context.Canceled)
+}
+
 // ============================================================================
 // HELPER WRAPPERS
 // (Because some methods are attached to internal structs we can't fully alias)
@@ -207,6 +311,16 @@ func NewExclusiveLock(ctx context.Context, repo restic.Repository, retrySleep ti
 
 func LoadSnapshot(ctx context.Context, repo restic.Repository, id ID) (*Snapshot, error) {
 	return data.LoadSnapshot(ctx, restic.LoaderUnpacked(repo), id)
+}
+
+func FindLatestSnapshot(ctx context.Context, repo restic.Repository, paths []string, tags []string) (*Snapshot, error) {
+	filter := &data.SnapshotFilter{Paths: paths}
+	if len(tags) > 0 {
+		filter.Tags = data.TagLists{tags}
+	}
+
+	sn, _, err := filter.FindLatest(ctx, repo, repo, "latest")
+	return sn, err
 }
 
 // Tree/Node types and LoadTree for snapshot browsing.
