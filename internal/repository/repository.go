@@ -564,6 +564,8 @@ func (r *Repository) removeUnpacked(ctx context.Context, t restic.FileType, id r
 }
 
 func (r *Repository) WithBlobUploader(ctx context.Context, fn func(ctx context.Context, uploader restic.BlobSaverWithAsync) error) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	wg, ctx := errgroup.WithContext(ctx)
 	limit := 2 + runtime.GOMAXPROCS(0)
 	fmt.Fprintf(os.Stderr, "[DEBUG WithBlobUploader] SetLimit=%d GOMAXPROCS=%d Connections=%d\n", limit, runtime.GOMAXPROCS(0), r.Connections())
@@ -574,8 +576,19 @@ func (r *Repository) WithBlobUploader(ctx context.Context, fn func(ctx context.C
 	// blob saver are spawned on demand, use wait group to keep track of them
 	r.blobSaver = &sync.WaitGroup{}
 	wg.Go(func() error {
+		inCallback := true
+		defer func() {
+			// when the defer is called while inCallback is true, this means
+			// that runtime.Goexit was called within `fn`. This should only happen
+			// if a test uses t.Fatal within `fn`.
+			if inCallback {
+				cancel()
+			}
+		}()
 		fmt.Fprintf(os.Stderr, "[DEBUG WithBlobUploader] calling fn\n")
-		if err := fn(ctx, &blobSaverRepo{repo: r}); err != nil {
+		err := fn(ctx, &blobSaverRepo{repo: r})
+		inCallback = false
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "[DEBUG WithBlobUploader] fn ERROR: %v\n", err)
 			return err
 		}
@@ -1285,7 +1298,7 @@ func (b *packBlobIterator) Next() (packBlobValue, error) {
 	nonce, ciphertext := buf[:b.key.NonceSize()], buf[b.key.NonceSize():]
 	plaintext, err := b.key.Open(ciphertext[:0], nonce, ciphertext, nil)
 	if err != nil {
-		err = fmt.Errorf("decrypting blob %v from %v failed: %w", h, b.packID.Str(), err)
+		err = fmt.Errorf("decrypting blob %v from pack %v failed: %w", h, b.packID.String(), err)
 	}
 	if err == nil && entry.IsCompressed() {
 		// DecodeAll will allocate a slice if it is not large enough since it
@@ -1293,16 +1306,16 @@ func (b *packBlobIterator) Next() (packBlobValue, error) {
 		b.decode, err = b.dec.DecodeAll(plaintext, b.decode[:0])
 		plaintext = b.decode
 		if err != nil {
-			err = fmt.Errorf("decompressing blob %v from %v failed: %w", h, b.packID.Str(), err)
+			err = fmt.Errorf("decompressing blob %v from pack %v failed: %w", h, b.packID.String(), err)
 		}
 	}
 	if err == nil {
 		id := restic.Hash(plaintext)
 		if !id.Equal(entry.ID) {
-			debug.Log("read blob %v/%v from %v: wrong data returned, hash is %v",
-				h.Type, h.ID, b.packID.Str(), id)
-			err = fmt.Errorf("read blob %v from %v: wrong data returned, hash is %v",
-				h, b.packID.Str(), id)
+			debug.Log("read blob %v/%v from pack %v: wrong data returned, hash is %v",
+				h.Type, h.ID, b.packID.String(), id)
+			err = fmt.Errorf("read blob %v from pack %v: wrong data returned, hash is %v",
+				h, b.packID.String(), id)
 		}
 	}
 
