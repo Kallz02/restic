@@ -3,6 +3,7 @@ package client_adapter
 import (
 	"context"
 	stderrors "errors"
+	"strings"
 	"time"
 
 	"github.com/restic/restic/internal/archiver"
@@ -47,6 +48,7 @@ type FileInfo = backend.FileInfo
 type RewindReader = backend.RewindReader
 type BlobType = restic.BlobType
 type BackendProperties = backend.Properties
+type CompressionMode = repository.CompressionMode
 
 // ============================================================================
 // REPOSITORY
@@ -54,6 +56,20 @@ type BackendProperties = backend.Properties
 
 func NewRepository(be Backend, opts Options) (*Repository, error) {
 	return repository.New(be, opts)
+}
+
+func ParseCompressionMode(value string) (CompressionMode, error) {
+	mode := repository.CompressionAuto
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return mode, nil
+	}
+
+	if err := mode.Set(trimmed); err != nil {
+		return mode, err
+	}
+
+	return mode, nil
 }
 
 // ============================================================================
