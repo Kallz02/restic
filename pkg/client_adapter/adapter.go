@@ -323,6 +323,26 @@ func FindLatestSnapshot(ctx context.Context, repo restic.Repository, paths []str
 	return sn, err
 }
 
+func FindLatestSnapshotForBackup(ctx context.Context, repo restic.Repository, paths []string, tags []string, hostname string, timeStampLimit time.Time) (*Snapshot, error) {
+	filter := &data.SnapshotFilter{
+		TimestampLimit: timeStampLimit,
+		Paths:          paths,
+	}
+	if hostname != "" {
+		filter.Hosts = []string{hostname}
+	}
+	if len(tags) > 0 {
+		filter.Tags = data.TagLists{tags}
+	}
+
+	sn, _, err := filter.FindLatest(ctx, repo, repo, "latest")
+	if stderrors.Is(err, data.ErrNoSnapshotFound) {
+		return nil, nil
+	}
+
+	return sn, err
+}
+
 // Tree/Node types and LoadTree for snapshot browsing.
 // upstream data.LoadTree now returns an iterator, so we materialize it back
 // into the old Tree{Nodes} shape expected by the FFI layer.
