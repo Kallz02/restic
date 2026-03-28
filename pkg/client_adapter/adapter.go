@@ -3,6 +3,8 @@ package client_adapter
 import (
 	"context"
 	stderrors "errors"
+	"path"
+	"reflect"
 	"strings"
 	"time"
 
@@ -19,6 +21,8 @@ import (
 	"github.com/restic/restic/internal/restorer"
 	"github.com/restic/restic/internal/ui"
 	"github.com/restic/restic/internal/ui/progress"
+	restoreui "github.com/restic/restic/internal/ui/restore"
+	"github.com/restic/restic/internal/walker"
 )
 
 const (
@@ -477,6 +481,360 @@ func NewIDSet() restic.IDSet {
 	return restic.NewIDSet()
 }
 
+// ============================================================================
+// KEY HINT OPTIMIZATION
+// ============================================================================
+
+// RepositoryKeyID returns the key ID of the currently-loaded key.
+// Cache this after a successful SearchKey and pass it as keyHint on
+// subsequent opens to skip the expensive key-listing loop.
+func RepositoryKeyID(repo *Repository) ID {
+	return repo.KeyID()
+}
+
+// ============================================================================
+// PARALLEL TREE STREAMING
+// ============================================================================
+
+// TreeNodeIterator is an alias for the streaming tree node iterator.
+type TreeNodeIterator = data.TreeNodeIterator
+
+// NodeOrError wraps a node or error from a tree iterator.
+type NodeOrError = data.NodeOrError
+
+// StreamTrees loads trees and their subtrees in parallel using
+// repo.Connections()+GOMAXPROCS worker goroutines.
+// The skip callback is single-threaded; process is called from workers and
+// MUST consume the iterator fully.
+func StreamTrees(
+	ctx context.Context,
+	repo *Repository,
+	trees []ID,
+	p *progress.Counter,
+	skip func(tree ID) bool,
+	process func(id ID, err error, nodes TreeNodeIterator) error,
+) error {
+	return data.StreamTrees(ctx, repo, trees, p, skip, process)
+}
+
 // func NewCountedBlobSet() restic.CountedBlobSet {
 // 	return restic.NewCountedBlobSet()
 // }
+
+// ============================================================================
+// DIFF
+// ============================================================================
+
+// DiffChange represents a single change between two snapshots.
+type DiffChange struct {
+	Path     string `json:"path"`
+	Modifier string `json:"modifier"` // "+", "-", "M", "U", "T", "?"
+}
+
+// DiffStat collects stats for all types of items.
+type DiffStat struct {
+	Files     int    `json:"files"`
+	Dirs      int    `json:"dirs"`
+	Others    int    `json:"others"`
+	DataBlobs int    `json:"data_blobs"`
+	TreeBlobs int    `json:"tree_blobs"`
+	Bytes     uint64 `json:"bytes"`
+}
+
+// DiffStats holds aggregate diff statistics.
+type DiffStats struct {
+	ChangedFiles int      `json:"changed_files"`
+	Added        DiffStat `json:"added"`
+	Removed      DiffStat `json:"removed"`
+}
+
+func addDiffStatNode(s *DiffStat, node *Node) {
+	if node == nil {
+		return
+	}
+	switch node.Type {
+	case data.NodeTypeFile:
+		s.Files++
+	case data.NodeTypeDir:
+		s.Dirs++
+	default:
+		s.Others++
+	}
+}
+
+// diffPrintDir recursively collects all changes for a directory added or removed entirely.
+func diffPrintDir(ctx context.Context, repo restic.BlobLoader, mode string, stats *DiffStat, prefix string, id ID, changes *[]DiffChange) error {
+	tree, err := data.LoadTree(ctx, repo, id)
+	if err != nil {
+		return err
+	}
+	for item := range tree {
+		if item.Error != nil {
+			return item.Error
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		node := item.Node
+		name := path.Join(prefix, node.Name)
+		if node.Type == data.NodeTypeDir {
+			name += "/"
+		}
+		*changes = append(*changes, DiffChange{Path: name, Modifier: mode})
+		addDiffStatNode(stats, node)
+		if node.Type == data.NodeTypeDir {
+			if err := diffPrintDir(ctx, repo, mode, stats, name, *node.Subtree, changes); err != nil && err != context.Canceled {
+				continue
+			}
+		}
+	}
+	return ctx.Err()
+}
+
+// diffTree recursively compares two trees and collects changes.
+func diffTree(ctx context.Context, repo restic.BlobLoader, stats *DiffStats, prefix string, id1, id2 ID, changes *[]DiffChange, showMetadata bool) error {
+	tree1, err := data.LoadTree(ctx, repo, id1)
+	if err != nil {
+		return err
+	}
+	tree2, err := data.LoadTree(ctx, repo, id2)
+	if err != nil {
+		return err
+	}
+
+	for dt := range data.DualTreeIterator(tree1, tree2) {
+		if dt.Error != nil {
+			return dt.Error
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		node1 := dt.Tree1
+		node2 := dt.Tree2
+
+		var name string
+		if node1 != nil {
+			name = node1.Name
+		} else {
+			name = node2.Name
+		}
+
+		switch {
+		case node1 != nil && node2 != nil:
+			fullName := path.Join(prefix, name)
+			mod := ""
+
+			if node1.Type != node2.Type {
+				mod += "T"
+			}
+
+			if node2.Type == data.NodeTypeDir {
+				fullName += "/"
+			}
+
+			if node1.Type == data.NodeTypeFile &&
+				node2.Type == data.NodeTypeFile &&
+				!reflect.DeepEqual(node1.Content, node2.Content) {
+				mod += "M"
+				stats.ChangedFiles++
+
+				// bitrot detection
+				node1Copy := *node1
+				node2Copy := *node2
+				node1Copy.Content = nil
+				node2Copy.Content = nil
+				if node1Copy.Equals(node2Copy) {
+					mod += "?"
+				}
+			} else if showMetadata && !node1.Equals(*node2) {
+				mod += "U"
+			}
+
+			if mod != "" {
+				*changes = append(*changes, DiffChange{Path: fullName, Modifier: mod})
+			}
+
+			if node1.Type == data.NodeTypeDir && node2.Type == data.NodeTypeDir {
+				if !(*node1.Subtree).Equal(*node2.Subtree) {
+					if err := diffTree(ctx, repo, stats, fullName, *node1.Subtree, *node2.Subtree, changes, showMetadata); err != nil && err != context.Canceled {
+						continue
+					}
+				}
+			}
+
+		case node1 != nil && node2 == nil:
+			fullName := path.Join(prefix, name)
+			if node1.Type == data.NodeTypeDir {
+				fullName += "/"
+			}
+			*changes = append(*changes, DiffChange{Path: fullName, Modifier: "-"})
+			addDiffStatNode(&stats.Removed, node1)
+			if node1.Type == data.NodeTypeDir {
+				if err := diffPrintDir(ctx, repo, "-", &stats.Removed, fullName, *node1.Subtree, changes); err != nil && err != context.Canceled {
+					continue
+				}
+			}
+
+		case node1 == nil && node2 != nil:
+			fullName := path.Join(prefix, name)
+			if node2.Type == data.NodeTypeDir {
+				fullName += "/"
+			}
+			*changes = append(*changes, DiffChange{Path: fullName, Modifier: "+"})
+			addDiffStatNode(&stats.Added, node2)
+			if node2.Type == data.NodeTypeDir {
+				if err := diffPrintDir(ctx, repo, "+", &stats.Added, fullName, *node2.Subtree, changes); err != nil && err != context.Canceled {
+					continue
+				}
+			}
+		}
+	}
+
+	return ctx.Err()
+}
+
+// ComputeDiff compares two snapshots and returns all changes + aggregate stats.
+func ComputeDiff(ctx context.Context, repo *Repository, sn1, sn2 *Snapshot) ([]DiffChange, DiffStats, error) {
+	if sn1.Tree == nil {
+		return nil, DiffStats{}, stderrors.New("snapshot 1 has nil tree")
+	}
+	if sn2.Tree == nil {
+		return nil, DiffStats{}, stderrors.New("snapshot 2 has nil tree")
+	}
+
+	var changes []DiffChange
+	stats := DiffStats{}
+
+	err := diffTree(ctx, repo, &stats, "/", *sn1.Tree, *sn2.Tree, &changes, true)
+	if err != nil {
+		return nil, DiffStats{}, err
+	}
+
+	return changes, stats, nil
+}
+
+// ============================================================================
+// SNAPSHOT GROUPING
+// ============================================================================
+
+type SnapshotGroupByOptions = data.SnapshotGroupByOptions
+type SnapshotGroupKey = data.SnapshotGroupKey
+type Snapshots = data.Snapshots
+type ExpirePolicy = data.ExpirePolicy
+type KeepReason = data.KeepReason
+
+// GroupSnapshots groups snapshots by the given criteria.
+func GroupSnapshots(snapshots Snapshots, groupBy SnapshotGroupByOptions) (map[string]Snapshots, bool, error) {
+	return data.GroupSnapshots(snapshots, groupBy)
+}
+
+// ApplyPolicy returns the snapshots to keep and remove according to the policy.
+func ApplyPolicy(list Snapshots, p ExpirePolicy) (keep, remove Snapshots, reasons []KeepReason) {
+	return data.ApplyPolicy(list, p)
+}
+
+// ============================================================================
+// FORGET (REMOVE SNAPSHOT)
+// ============================================================================
+
+// RemoveSnapshot removes a single snapshot from the repository.
+func RemoveSnapshot(ctx context.Context, repo *Repository, id ID) error {
+	return repo.RemoveUnpacked(ctx, restic.WriteableSnapshotFile, id)
+}
+
+// SaveSnapshot saves a (possibly modified) snapshot and returns its new ID.
+func SaveSnapshot(ctx context.Context, repo *Repository, sn *Snapshot) (ID, error) {
+	return data.SaveSnapshot(ctx, repo, sn)
+}
+
+// ForAllSnapshots iterates all snapshots in the repository.
+func ForAllSnapshots(ctx context.Context, repo *Repository, excludeIDs IDSet, fn func(ID, *Snapshot, error) error) error {
+	return data.ForAllSnapshots(ctx, repo, repo, excludeIDs, fn)
+}
+
+// ============================================================================
+// REWRITE (TREE REWRITER)
+// ============================================================================
+
+type TreeRewriter = walker.TreeRewriter
+type RewriteOpts = walker.RewriteOpts
+type NodeRewriteFunc = walker.NodeRewriteFunc
+type SnapshotSize = walker.SnapshotSize
+type QueryRewrittenSizeFunc = walker.QueryRewrittenSizeFunc
+
+func NewTreeRewriter(opts RewriteOpts) *TreeRewriter {
+	return walker.NewTreeRewriter(opts)
+}
+
+func NewSnapshotSizeRewriter(rewriteNode NodeRewriteFunc, keepEmpty walker.NodeKeepEmptyDirectoryFunc) (*TreeRewriter, QueryRewrittenSizeFunc) {
+	return walker.NewSnapshotSizeRewriter(rewriteNode, keepEmpty)
+}
+
+// RewriteSnapshot rewrites a snapshot's tree, excluding the given paths.
+// Returns the new snapshot ID. The original snapshot is NOT removed.
+func RewriteSnapshot(ctx context.Context, repo *Repository, sn *Snapshot, excludePaths []string) (ID, *SnapshotSize, error) {
+	excludeSet := make(map[string]bool, len(excludePaths))
+	for _, p := range excludePaths {
+		excludeSet[p] = true
+	}
+
+	rewriteNode := func(node *Node, nodePath string) *Node {
+		if excludeSet[nodePath] {
+			return nil // remove this node
+		}
+		return node
+	}
+
+	rewriter, querySize := NewSnapshotSizeRewriter(rewriteNode, func(_ string) bool { return false })
+
+	var newTreeID ID
+	err := repo.WithBlobUploader(ctx, func(ctx context.Context, uploader restic.BlobSaverWithAsync) error {
+		var rewriteErr error
+		newTreeID, rewriteErr = rewriter.RewriteTree(ctx, repo, uploader, "/", *sn.Tree)
+		return rewriteErr
+	})
+	if err != nil {
+		return ID{}, nil, err
+	}
+
+	if newTreeID.IsNull() {
+		return ID{}, nil, stderrors.New("rewrite resulted in empty snapshot")
+	}
+
+	// Create a copy of the snapshot with the new tree
+	newSn := *sn
+	newSn.Tree = &newTreeID
+	if sn.ID() != nil {
+		original := *sn.ID()
+		newSn.Original = &original
+	}
+
+	newID, err := SaveSnapshot(ctx, repo, &newSn)
+	if err != nil {
+		return ID{}, nil, err
+	}
+
+	size := querySize()
+	return newID, &size, nil
+}
+
+// ============================================================================
+// RESTORE PROGRESS
+// ============================================================================
+
+type RestoreProgress = restoreui.Progress
+type RestoreState = restoreui.State
+type RestoreProgressPrinter = restoreui.ProgressPrinter
+type RestoreItemAction = restoreui.ItemAction
+type ProgressCounter = progress.Counter
+
+func NewRestoreProgress(printer RestoreProgressPrinter, interval time.Duration) *RestoreProgress {
+	return restoreui.NewProgress(printer, interval)
+}
+
+// SelectFilter is the type for chooseing which items to restore.
+type SelectFilter = func(item string, isDir bool) (selectedForRestore bool, childMayBeSelected bool)
+
+// Restorer type alias
+type Restorer = restorer.Restorer
