@@ -411,6 +411,8 @@ var NumBlobTypes = restic.NumBlobTypes
 
 // Interface Aliases
 type MasterIndex = index.MasterIndex
+type Blob = restic.Blob
+type BlobHandle = restic.BlobHandle
 type PackedBlob = restic.PackedBlob
 type BlobSet = restic.BlobSet
 type IDSet = restic.IDSet
